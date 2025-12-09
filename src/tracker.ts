@@ -199,6 +199,23 @@ export class WhatsAppTracker {
             if (result?.key?.id) {
                 trackerLogger.debug(`[PROBE] Probe sent successfully, message ID: ${result.key.id}`);
                 this.probeStartTimes.set(result.key.id, startTime);
+
+                // Set timeout: if no CLIENT ACK within 10 seconds, mark device as OFFLINE
+                const timeoutId = setTimeout(() => {
+                    if (this.probeStartTimes.has(result.key.id!)) {
+                        const elapsedTime = Date.now() - startTime;
+                        trackerLogger.debug(`[PROBE TIMEOUT] No CLIENT ACK for ${result.key.id} after ${elapsedTime}ms - Device is OFFLINE`);
+                        this.probeStartTimes.delete(result.key.id!);
+                        this.probeTimeouts.delete(result.key.id!);
+
+                        // Mark device as OFFLINE due to no response
+                        if (result.key.remoteJid) {
+                            this.markDeviceOffline(result.key.remoteJid, elapsedTime);
+                        }
+                    }
+                }, 10000); // 10 seconds timeout
+
+                this.probeTimeouts.set(result.key.id, timeoutId);
             } else {
                 trackerLogger.debug('[PROBE ERROR] Failed to get message ID from send result');
             }
@@ -220,6 +237,8 @@ export class WhatsAppTracker {
 
         trackerLogger.debug(`[TRACKING] Message Update - ID: ${msgId}, JID: ${fromJid}, Status: ${status} (${this.getStatusName(status)})`);
 
+        // Only CLIENT ACK (3) means device is online and received the message
+        // SERVER ACK (2) only means server received it, not the device
         if (status === 3) { // CLIENT ACK
             const startTime = this.probeStartTimes.get(msgId);
 
@@ -255,6 +274,32 @@ export class WhatsAppTracker {
     }
 
     /**
+     * Mark a device as OFFLINE when no CLIENT ACK is received
+     * @param jid Device JID
+     * @param timeout Time elapsed before timeout
+     */
+    private markDeviceOffline(jid: string, timeout: number) {
+        // Initialize device metrics if not exists
+        if (!this.deviceMetrics.has(jid)) {
+            this.deviceMetrics.set(jid, {
+                rttHistory: [],
+                recentRtts: [],
+                state: 'OFFLINE',
+                lastRtt: timeout,
+                lastUpdate: Date.now()
+            });
+        } else {
+            const metrics = this.deviceMetrics.get(jid)!;
+            metrics.state = 'OFFLINE';
+            metrics.lastRtt = timeout;
+            metrics.lastUpdate = Date.now();
+        }
+
+        trackerLogger.info(`\n🔴 Device ${jid} marked as OFFLINE (no CLIENT ACK after ${timeout}ms)\n`);
+        this.sendUpdate();
+    }
+
+    /**
      * Add RTT measurement for a specific device and update its state
      * @param jid Device JID
      * @param rtt Round-trip time in milliseconds
@@ -273,6 +318,7 @@ export class WhatsAppTracker {
 
         const metrics = this.deviceMetrics.get(jid)!;
 
+        // Only add measurements if we actually received a CLIENT ACK (rtt <= 5000ms)
         if (rtt <= 5000) {
             // 1. Add to device's recent RTTs for moving average (last 3)
             metrics.recentRtts.push(rtt);
@@ -280,7 +326,7 @@ export class WhatsAppTracker {
                 metrics.recentRtts.shift();
             }
 
-            // 2. Add to device's history for calibration (last 50), filtering outliers > 5000ms
+            // 2. Add to device's history for calibration (last 2000), filtering outliers > 5000ms
             metrics.rttHistory.push(rtt);
             if (metrics.rttHistory.length > 2000) {
                 metrics.rttHistory.shift();
@@ -293,15 +339,13 @@ export class WhatsAppTracker {
             }
 
             metrics.lastRtt = rtt;
-        } else {
-            // RTT > 5000ms indicates device is OFFLINE
-            metrics.lastRtt = rtt;
-            metrics.state = 'OFFLINE';
-            trackerLogger.debug(`[DEVICE ${jid}] RTT: ${rtt}ms > 5000ms - Marking as OFFLINE`);
-        }
-        metrics.lastUpdate = Date.now();
+            metrics.lastUpdate = Date.now();
 
-        this.determineDeviceState(jid);
+            // Determine new state based on RTT
+            this.determineDeviceState(jid);
+        }
+        // If rtt > 5000ms, it means timeout - device is already marked as OFFLINE by markDeviceOffline()
+
         this.sendUpdate();
     }
 
@@ -313,11 +357,17 @@ export class WhatsAppTracker {
         const metrics = this.deviceMetrics.get(jid);
         if (!metrics) return;
 
-        // If marked OFFLINE due to high RTT (> 5000ms), keep that state
-        // Note: We only stay in OFFLINE if the CURRENT RTT is still > 5000ms
-        if (metrics.state === 'OFFLINE' && metrics.lastRtt > 5000) {
-            trackerLogger.debug(`[DEVICE ${jid}] Maintaining OFFLINE state (RTT: ${metrics.lastRtt}ms)`);
-            return;
+        // If device is marked as OFFLINE (no CLIENT ACK received), keep that state
+        // Only change back to Online/Standby if we receive new measurements
+        if (metrics.state === 'OFFLINE') {
+            // Check if this is a new measurement (device came back online)
+            if (metrics.lastRtt <= 5000 && metrics.recentRtts.length > 0) {
+                trackerLogger.debug(`[DEVICE ${jid}] Device came back online (RTT: ${metrics.lastRtt}ms)`);
+                // Continue with normal state determination below
+            } else {
+                trackerLogger.debug(`[DEVICE ${jid}] Maintaining OFFLINE state`);
+                return;
+            }
         }
 
         // Calculate device's moving average
