@@ -5,6 +5,8 @@ services:
       dockerfile: Dockerfile
       args:
         - PORT=${BACKEND_PORT:-3001}
+    extra_hosts:
+      - "localhost:host-gateway"
     ports:
       - "${BACKEND_PORT:-3001}:${BACKEND_PORT:-3001}"
     environment:
@@ -24,7 +26,7 @@ services:
       dockerfile: Dockerfile
       args:
         - PORT=${CLIENT_PORT:-3000}
-        - REACT_APP_API_URL=http://localhost:${BACKEND_PORT:-3001}
+        - REACT_APP_API_URL=${BACKEND_URL:-http://localhost:3001}
     ports:
       - "${CLIENT_PORT:-3000}:${CLIENT_PORT:-3000}"
     environment:
@@ -34,6 +36,16 @@ services:
     networks:
       - app-network
     restart: unless-stopped
+
+  signal-api:
+    image: bbernhard/signal-cli-rest-api
+    ports:
+      - "8080:8080"
+    environment:
+      - MODE=json-rpc
+    restart: unless-stopped
+    networks:
+      - app-network
 
 volumes:
   baileys_auth:
